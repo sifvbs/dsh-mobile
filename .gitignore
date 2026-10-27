@@ -1,0 +1,18 @@
+node_modules/
+bin/*.exe
+bin/*.zip
+
+# runtime artifacts produced by the scripts
+pair-url*.txt
+pair-qr*.png
+public-host.txt
+dev.txt
+*.log
+*.err
+
+# editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store

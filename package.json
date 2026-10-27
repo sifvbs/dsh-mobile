@@ -1,0 +1,38 @@
+{
+  "name": "dsh-mobile",
+  "version": "1.0.0",
+  "description": "Expose the DeepSeek Harness Web GUI to a phone over LAN or any network — no public IP, no port forwarding, no DSH patch.",
+  "license": "MIT",
+  "private": true,
+  "bin": {
+    "dsh-mobile-make-qr": "scripts/make-pair-qr.js"
+  },
+  "scripts": {
+    "qr": "node scripts/make-pair-qr.js",
+    "termqr": "node scripts/termqr.js",
+    "proxy": "node scripts/tcp-proxy.js",
+    "shim": "node scripts/tunnel-shim.js",
+    "verify": "node scripts/verify.js"
+  },
+  "optionalDependencies": {
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "^0.12.0",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sifvbs/dsh-mobile.git"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "remote",
+    "tunnel",
+    "cloudflared",
+    "qrcode",
+    "remote-web-ui"
+  ]
+}

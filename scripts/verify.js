@@ -18,6 +18,11 @@
  *
  * Requires a Chrome/Edge binary and the `ws` package (npm i ws), or set
  * CHROME_PATH / DSH_WS_MODULE.
+ *
+ * Options:
+ *   --url <pair-accept-url>  or  --host <host[:port]> --pair <token>
+ *   --cdp-port <n>    (default: an ephemeral free port, picked automatically)
+ *   --wait-ms <n>     overall budget for the three boot signals (default 20000)
  */
 const fs = require('fs');
 const os = require('os');
@@ -59,6 +64,39 @@ function loadWs() {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * Pick a free TCP port for CDP. The old default (9333) collided with any other
+ * Chrome/Edge already debugging, and a hardcoded port also breaks when two
+ * verify runs overlap. --cdp-port still wins when supplied explicitly.
+ */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = require('net').createServer();
+    srv.unref();
+    srv.on('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+/** Poll fn until it returns truthy or the budget runs out. */
+async function waitFor(fn, { timeoutMs, intervalMs, label }) {
+  const deadline = Date.now() + timeoutMs;
+  let last;
+  while (Date.now() < deadline) {
+    try {
+      last = await fn();
+      if (last) return last;
+    } catch (e) {
+      last = e;
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`${label || 'waitFor'} timed out after ${timeoutMs}ms`);
+}
+
 function httpJson(url) {
   return new Promise((resolve, reject) => {
     http
@@ -89,7 +127,8 @@ function httpJson(url) {
   }
 
   const chrome = findChrome();
-  const port = Number(argOf('--cdp-port', 9333));
+  const explicitPort = argOf('--cdp-port', '');
+  const port = explicitPort ? Number(explicitPort) : await freePort();
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-verify-'));
 
   const proc = spawn(
@@ -112,6 +151,11 @@ function httpJson(url) {
     } catch {
       /* ignore */
     }
+    try {
+      fs.rmSync(userDataDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
   };
   process.on('exit', cleanup);
 
@@ -125,6 +169,7 @@ function httpJson(url) {
     }
   }
   if (!version) throw new Error(`Chrome did not expose CDP on ${port}`);
+  console.log('CDP    ', port, '(', version.Browser || 'unknown', ')');
 
   const targets = await httpJson(`http://127.0.0.1:${port}/json/list`);
   const page = targets.find((t) => t.type === 'page');
@@ -165,9 +210,6 @@ function httpJson(url) {
   for (const d of ['Page', 'Runtime', 'Network']) await send(`${d}.enable`);
   await send('Page.navigate', { url: target });
 
-  // the SPA needs a few seconds to mount after the shell loads
-  await sleep(9000);
-
   const evalJs = async (expr) => {
     const r = await send('Runtime.evaluate', {
       expression: expr,
@@ -177,19 +219,65 @@ function httpJson(url) {
     return r && r.result ? r.result.value : undefined;
   };
 
+  const slotsExpr = 'document.querySelectorAll("[data-dsh-slot], [data-slot]").length';
+  const ownsExpr = '!!(window.__DSH_TRANSPORT__ && window.__DSH_TRANSPORT__.ownsHost)';
+  const muxHit = () => requests.find((u) => u.includes('/remote/api/remote.mux'));
+
+  // Wait for the three real signals instead of sleeping a fixed 9s. Each one can
+  // arrive well before or after that mark depending on machine load and whether
+  // the page came from cache, so polling with a budget is both faster and safer.
+  // --wait-ms is the overall budget (default 20000).
+  const waitMs = Number(argOf('--wait-ms', '20000'));
+  const t0 = Date.now();
+
+  let slots = 0;
+  try {
+    await waitFor(
+      async () => {
+        slots = Number(await evalJs(slotsExpr)) || 0;
+        return slots > 5;
+      },
+      { timeoutMs: waitMs, intervalMs: 400, label: 'slots' },
+    );
+  } catch {
+    /* leave slots at whatever we last saw */
+  }
+
+  let owns = false;
+  try {
+    await waitFor(
+      async () => {
+        owns = (await evalJs(ownsExpr)) === true;
+        return owns;
+      },
+      { timeoutMs: Math.max(2000, waitMs - (Date.now() - t0)), intervalMs: 400, label: 'owns' },
+    );
+  } catch {
+    /* leave owns false */
+  }
+
+  try {
+    await waitFor(async () => muxHit(), {
+      timeoutMs: Math.max(2000, waitMs - (Date.now() - t0)),
+      intervalMs: 400,
+      label: 'mux',
+    });
+  } catch {
+    /* wsUrl stays (none) */
+  }
+
+  const waitedMs = Date.now() - t0;
+
   const finalUrl = await evalJs('location.href');
-  const slots = await evalJs(
-    'document.querySelectorAll("[data-dsh-slot], [data-slot]").length',
-  );
-  const owns = await evalJs('!!(window.__DSH_TRANSPORT__ && window.__DSH_TRANSPORT__.ownsHost)');
   const bodyText = await evalJs('document.body ? document.body.innerText.slice(0, 200) : ""');
 
-  const wsUrl = requests.find((u) => u.includes('/remote/api/remote.mux')) || '(none)';
+  const wsUrl = muxHit() || '(none)';
 
   console.log('URL    ', finalUrl);
   console.log('SLOTS  ', slots);
   console.log('OWNS   ', owns);
   console.log('WS     ', wsUrl);
+  console.log('WAIT   ', waitedMs + 'ms');
   console.log('REQ    ', requests.length, ' RESP', responses.length);
   if (failures.length) {
     console.log('FAILED ', failures.length);

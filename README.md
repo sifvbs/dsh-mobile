@@ -96,26 +96,37 @@ https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-w
 [3] Both at once                  -> both
 ```
 
-默认 DSH 端口是 `3080`。实际端口看 DSH Web GUI 的地址，或者：
+**默认端口 `3080` 只是占位** —— DSH 桌面版每次启动随机挑一个空闲端口，没有固定值。先看地址栏，或者：
+
+```powershell
+# 找出当前 DSH Web GUI 实际端口（监听 loopback 的那个 node/electron 进程）
+Get-NetTCPConnection -State Listen | Where-Object {
+  $_.LocalAddress -eq '127.0.0.1' -and $_.OwningProcess -in (Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue).Id
+} | Select-Object LocalPort, OwningProcess
+```
+
+拿到端口后：
 
 ```cmd
-set DSH_PORT=58202 && go.cmd
+set DSH_PORT=55129 && go.cmd
 
 rem 顺手改 profile 配置（推荐）
-set DSH_PORT=58202 && set DSH_PROFILE=desktop && go.cmd
+set DSH_PORT=55129 && set DSH_PROFILE=desktop && go.cmd
 ```
 
 ### 命令行
 
+下面示例里的 `-DshPort 55129` 按上一步实测值替换（`3080` 只是脚本里的默认占位，本机从来不是这个值）：
+
 ```powershell
 # 同 WiFi
-powershell -NoProfile -ExecutionPolicy Bypass -File .\pair-qr.ps1 -Mode lan -DshPort 3080 -Profile desktop
+powershell -NoProfile -ExecutionPolicy Bypass -File .\pair-qr.ps1 -Mode lan -DshPort 55129 -Profile desktop
 
 # 异网（起隧道 + 出码）
-powershell -NoProfile -ExecutionPolicy Bypass -File .\pair-qr.ps1 -Mode tunnel -DshPort 3080 -Profile desktop
+powershell -NoProfile -ExecutionPolicy Bypass -File .\pair-qr.ps1 -Mode tunnel -DshPort 55129 -Profile desktop
 
 # 两条一起出（先起隧道，publicBaseUrl 用隧道域名）
-powershell -NoProfile -ExecutionPolicy Bypass -File .\pair-qr.ps1 -Mode both -DshPort 3080 -Profile desktop
+powershell -NoProfile -ExecutionPolicy Bypass -File .\pair-qr.ps1 -Mode both -DshPort 55129 -Profile desktop
 ```
 
 参数：
@@ -123,7 +134,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\pair-qr.ps1 -Mode both -Ds
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-Mode` | `lan` | `lan` / `tunnel` / `both` |
-| `-DshPort` | `3080` | DSH webserver 端口 |
+| `-DshPort` | `3080`（占位） | DSH webserver 端口。**必填实测值**，见上一节 |
 | `-LanPort` | `56875` | LAN 转发监听端口 |
 | `-ShimPort` | `56998` | 隧道 shim 监听端口 |
 | `-Ip` | 自动探测 | LAN 侧对外宣告的地址 |
@@ -160,6 +171,15 @@ node .\scripts\verify.js --url "https://xxx.trycloudflare.com/pair-accept?pair=.
 
 跑 headless Chrome，看四件事：`SLOTS`（SPA 是否真的挂载）、`OWNS`（host grant 是否送达）、`WS`（`/remote/api/remote.mux` 是否连上）、`REQ/RESP`。**curl 只能证明服务端在，证明不了 SPA 能跑起来。**
 
+判据是 `SLOTS > 5 && OWNS === true && WS !== '(none)'`，三条都满足才 `RESULT BOOTED OK`（exit 0），否则 exit 2。
+
+两个行为细节（v2 改的）：
+
+- **CDP 端口自动挑**。早期写死 `--cdp-port 9333`，机器上只要另有一个 Chrome/Edge 在调试就会撞车，两次 verify 并发也会撞。现在默认向内核要一个临时空闲端口（`--cdp-port` 显式传则仍以它为准），实际值打进 `CDP` 那一行。
+- **不再硬等 9 秒**。改为分别轮询三个真实信号（slots / owns / mux），拿到就往下走，`--wait-ms` 控制总预算（默认 20000）。机器快时几秒出结果，慢时也不会因为"9 秒不够"而误判。
+
+顺手还会清掉 `--user-data-dir` 那个临时目录（早期版本会把 `%TEMP%\dsh-verify-*` 攒一堆）。
+
 ---
 
 ## 五、两个脚本为什么存在
@@ -169,6 +189,30 @@ node .\scripts\verify.js --url "https://xxx.trycloudflare.com/pair-accept?pair=.
 纯 TCP 字节转发。**不改写任何 HTTP 头**——Host 必须原样到达 DSH，否则 `trustedHosts` 栅栏对不上。
 
 为什么不直接改 DSH 的绑定地址：见上面第一节，`Config` 拒绝 `0.0.0.0`，而桌面宿主又是以 `127.0.0.1` 起的。
+
+参数（`node scripts/tcp-proxy.js --help` 语义见文件头）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--listen` | `127.0.0.1` | 绑定的具体地址。**不要 `0.0.0.0`**，那等于把 RCE 面开给整个网段 |
+| `--port` | `56875` | 监听端口 |
+| `--target` | `127.0.0.1:55129` | 转发目标 |
+| `--max-connections` | `256` | 并发连接上限，超了直接 destroy 并计入 `rejected` |
+| `--connect-timeout-ms` | `10000` | 连上游超时 |
+| `--idle-timeout-ms` | `300000` | 单连接空闲超时，`0` 关闭 |
+| `--health-port` | `56876` | 健康/统计端点端口，`0` 关闭 |
+| `--verbose` | `0` | `1` = 每条连接打一行 |
+
+健康端点**只绑 loopback**（`health.listen(port, '127.0.0.1')`），LAN 侧永远看不到：
+
+```powershell
+curl.exe -s http://127.0.0.1:56876/health
+# {"ok":true,"listen":"10.22.197.105:56875","target":"127.0.0.1:55129",
+#  "live":1,"peak":3,"admitted":12,"rejected":0,"bytesUp":1234,"bytesDown":5678,
+#  "uptimeSecs":3600,"maxConnections":256}
+```
+
+> 早期版本的 `live` 变量只是个自增自减计数器，从没被读过——v2 把它接进 `/health`，并补了 `peak` / `admitted` / `rejected` / 双向字节数 / uptime。排查"手机连不上"时先看 `live` 是不是 0、`rejected` 有没有涨。
 
 ### `scripts/tunnel-shim.js`
 
@@ -188,7 +232,43 @@ POST /api/pair/stop     停掉本次配对
 POST /api/pair/revoke   吊销任意设备
 ```
 
-`tunnel-shim.js` 对这三条硬编码 403（`LOOPBACK_ONLY`）。**不要删掉那个检查。**
+`tunnel-shim.js` 对这四类路径返回 403（`LOOPBACK_ONLY_PREFIXES`）。**不要删掉那个检查。**
+
+#### v2 修掉的绕过（v1 可被裸公网利用，务必用 v2）
+
+v1 的判定是**精确字符串比较**：
+
+```js
+const path = (req.url || '').split('?')[0].replace(/\/+$/, '') || '/';
+return LOOPBACK_ONLY.has(path);
+```
+
+于是下面这些请求归一化后都是 `/api/pair/issue`，但字符串对不上，403 判定直接失效：
+
+```
+POST /api/pair/./issue           → 200，返回 {"ok":true,"token":"…"}
+POST /api/pair/x/../issue        → 200
+POST /api/pair/issue%20          → 200
+GET  /%61pi/pair/issue           → 200（%61 = a）
+GET  //api/pair/issue            → 部分中间件会先折叠
+GET  /API/PAIR/ISSUE             → 大小写
+```
+
+拿到 token 后再 `POST /api/pair/accept {"token":…}` 就能自助登记一台设备、拿到一年期 `dsh_pair` cookie —— **等于把整台 DSH 的远程入口开源给了任何扫到该域名的人**。实测 v1 完整复现过这条链。
+
+v2 的判定改成：
+
+1. `safeDecode`：最多三层 `decodeURIComponent`（挡 `%252e` 双重编码），失败时逐 `%XX` 容错；
+2. 反斜杠转斜杠 → 折叠 `/{2,}` → 解 `.` / `..` → 转小写 → 逐段去空白（含 `%09`、`\u00a0`） → 去尾斜杠；
+3. 对归一化结果做**前缀**匹配（`p === prefix || p.startsWith(prefix + '/')`），前缀表含 `/api/pair/issue|stop|revoke|lan-bind`。
+
+另外补了三个洞：
+
+- **Host 未校验** → 任何人都能直连 `127.0.0.1:56998` 冒充隧道流量。v2 要求 Host 等于 `public-host.txt` 里的域名或回环名，否则 **421**（`--strict-host 0` 可临时关）。
+- **无体积上限 / 无超时** → v2 加 `64 MiB` 请求体上限（`content-length` 预检 + 流式累计）、上游首包 `30s` 超时、`5 min` 空闲断流。
+- **`public-host.txt` 每请求同步重读** → 改按 mtime 缓存。
+
+v2 新增参数：`--max-body-bytes`、`--upstream-header-timeout-ms`、`--idle-timeout-ms`、`--strict-host`、`--verbose`，并带访问日志（`[shim] <UTC> …`）。
 
 ---
 
@@ -205,14 +285,17 @@ POST /api/pair/revoke   吊销任意设备
 | pinggy | SSH 连上后长时间无任何输出 |
 | **cloudflared quick tunnel** | **9.2 MB / 3.1 s ≈ 3 MB/s**，快 130 倍 —— 采用 |
 
-cloudflared 本身还有三个坑，`pair-qr.ps1` 都处理了：
+cloudflared 本身还有三个坑，但**三个坑不是同一处修的**，看这一节时别搞混：
 
 1. **系统 DNS 拒绝解析 SRV** → `lookup argotunnel.com: dnsquery: DNS operation refused.`，edge discovery 直接失败。
    → 用 `$env:TUNNEL_EDGE` 显式给 `IP:7844`。**端口必须带**，只写 IP 会报 `missing port in address`。
+   **修在 `pair-qr.ps1`**（`$env:TUNNEL_EDGE = '198.41.192.227:7844,…'`）。
 2. **系统 DNS 只回 AAAA** → 新域名本机只能解析到 `2606:4700::…`，`curl` 直接 000。
-   → 走 DoH（`223.5.5.5/resolve`）取 IPv4 再 `--resolve` 钉住。手机端不受影响（运营商 DNS 正常）。
+   → 走 DoH（`https://223.5.5.5/resolve?name=<host>&type=A`）取 IPv4，再给 curl 加 `--resolve "<host>:443:<ip>"` 钉住。
+   **修在 `remote.ps1` 的 `Resolve-CfFrontend` 里，不在 `pair-qr.ps1` 里** —— `pair-qr.ps1` 只做 `TUNNEL_EDGE` 那一层，本机若真遇到只回 AAAA，`ensure-tunnel` 后的 `/api/pair/status` 探测会一直超时。
+   手机端不受影响（运营商 DNS 正常给 A 记录），所以**手机能用、本机 curl 000** 是这条的典型症状。
 3. **QUIC 会被中途掐断** → `accept stream listener error: … no recent network activity`，随后域名 530。
-   → `--protocol http2 --ha-connections 4`。单连接注册成功也仍可能 530，4 条才稳。
+   → `--protocol http2 --ha-connections 4`。单连接注册成功也仍可能 530，4 条才稳。**修在 `pair-qr.ps1`**。
 
 已知限制：quick tunnel 域名**每次重启都变**，无可用性保证。掉线就重跑脚本；要固定域名得用 named tunnel（需要 Cloudflare 账号和 `tunnelToken`）。
 
@@ -224,14 +307,15 @@ cloudflared 本身还有三个坑，`pair-qr.ps1` 都处理了：
 |---|---|
 | `go.cmd` | 双击入口，菜单三选一 |
 | `pair-qr.ps1` | 两种模式的统一出码器 |
-| `scripts/tcp-proxy.js` | LAN 纯 TCP 转发 |
-| `scripts/tunnel-shim.js` | 隧道前置，改写 Host / Origin / Location |
+| `package.json` | `scripts` 里的 `qr` / `proxy` / `shim` / `verify` / `termqr` 快捷方式，`optionalDependencies` 声明 `qrcode` / `qrcode-terminal` / `ws` |
+| `scripts/tcp-proxy.js` | LAN 纯 TCP 转发（并发上限 + 超时 + loopback 健康端点） |
+| `scripts/tunnel-shim.js` | 隧道前置，改写 Host / Origin / Location；v2 带路径归一化、Host 校验、体积上限、超时、访问日志 |
 | `scripts/make-pair-qr.js` | 一步签发 + 生成 PNG（给 IM 机器人用） |
 | `scripts/termqr.js` | 终端二维码 |
-| `scripts/verify.js` | headless Chrome 端到端验证 |
+| `scripts/verify.js` | headless Chrome 端到端验证（自适应 CDP 端口 + 信号轮询） |
 | `bin/cloudflared.exe` | 自备，见上文 |
 
-运行期生成的：`pair-url-*.txt`、`pair-qr-*.png`、`public-host.txt`、`proxy.log`、`shim.log`、`cf.log`、`cf.err`。
+运行期生成的：`pair-url-*.txt`、`pair-qr-*.png`、`public-host.txt`、`proxy.log`、`shim.log`、`cf.log`、`cf.err`。这些都在 `.gitignore` 里。
 
 ### 给 IM 机器人用
 

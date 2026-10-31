@@ -292,7 +292,24 @@ cloudflared 本身还有三个坑，但**三个坑不是同一处修的**，看�
    **修在 `pair-qr.ps1`**（`$env:TUNNEL_EDGE = '198.41.192.227:7844,…'`）。
 2. **系统 DNS 只回 AAAA** → 新域名本机只能解析到 `2606:4700::…`，`curl` 直接 000。
    → 走 DoH（`https://223.5.5.5/resolve?name=<host>&type=A`）取 IPv4，再给 curl 加 `--resolve "<host>:443:<ip>"` 钉住。
-   **修在 `remote.ps1` 的 `Resolve-CfFrontend` 里，不在 `pair-qr.ps1` 里** —— `pair-qr.ps1` 只做 `TUNNEL_EDGE` 那一层，本机若真遇到只回 AAAA，`ensure-tunnel` 后的 `/api/pair/status` 探测会一直超时。
+   **这一层仓库里没有现成实现，`pair-qr.ps1` 也没做** —— 它只处理上面第 1 条（`TUNNEL_EDGE`）。真碰上只回 AAAA 的机器，
+   `Ensure-Tunnel` 之后那句 `curl https://$h/api/pair/status` 会一直拿不到 200，脚本卡在等域名。自己补一个函数挂进去即可：
+
+   ```powershell
+   function Resolve-CfFrontend([string]$h) {
+     # 本机 DNS 对新 trycloudflare 域名只回 AAAA、不回 A 时，curl 直接 000。
+     # 走 DoH 拿 A 记录，拿到就返回第一个前端 IPv4；拿不到返回 $null。
+     $r = curl.exe -s --max-time 8 "https://223.5.5.5/resolve?name=$h&type=A" -H 'accept: application/dns-json' 2>$null
+     if ($r -match '"data"\s*:\s*"(\d+\.\d+\.\d+\.\d+)"') { return $Matches[1] }
+     return $null
+   }
+
+   # 用法：探测时钉住前端 IP
+   $ip  = Resolve-CfFrontend $h
+   $res = if ($ip) { "--resolve", "${h}:443:$ip" } else { @() }
+   curl.exe -s -o NUL -w '%{http_code}' --max-time 10 @res "https://$h/api/pair/status"
+   ```
+
    手机端不受影响（运营商 DNS 正常给 A 记录），所以**手机能用、本机 curl 000** 是这条的典型症状。
 3. **QUIC 会被中途掐断** → `accept stream listener error: … no recent network activity`，随后域名 530。
    → `--protocol http2 --ha-connections 4`。单连接注册成功也仍可能 530，4 条才稳。**修在 `pair-qr.ps1`**。
